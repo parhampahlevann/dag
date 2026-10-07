@@ -13,7 +13,8 @@ if [ ! -t 1 ] || [ "${TERM:-dumb}" = dumb ] || [ -n "${NO_COLOR+x}" ]; then
 fi
 
 LAUNCHER="/usr/local/bin/DaggerLauncher"
-LAUNCHER_LATEST_URL="https://github.com/itsFLoKi/daggerConnect/releases/latest/download/DaggerLauncher"
+BINARY_ZIP_URL="https://github.com/parhampahlevann/dag/releases/download/v4.2.8/v4.2.8.zip"
+FIXED_VERSION="v4.2.8"
 CONFIG_DIR="/etc/DaggerConnect"
 CONFIG=""
 CONFIG_FMT=""
@@ -51,22 +52,22 @@ hr()    { printf '\n%b  %s%b\n\n' "$BOLD" "$*" "$NC"; }
 
 ensure_runtime_dependencies() {
     local missing=0 cmd
-    for cmd in curl od cmp wc python3; do
+    for cmd in curl od cmp wc python3 unzip; do
         command -v "$cmd" >/dev/null 2>&1 || missing=1
     done
     [ "$missing" -eq 0 ] && return 0
 
-    info "Installing launcher download and version-list dependencies..."
+    info "Installing download and unzip dependencies..."
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq ca-certificates curl coreutils python3
+        apt-get update -qq && apt-get install -y -qq ca-certificates curl coreutils python3 unzip
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q ca-certificates curl coreutils python3
+        dnf install -y -q ca-certificates curl coreutils python3 unzip
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q ca-certificates curl coreutils python3
+        yum install -y -q ca-certificates curl coreutils python3 unzip
     else
-        error "Missing curl/coreutils/python3 and no supported package manager was found."
+        error "Missing curl/coreutils/python3/unzip and no supported package manager was found."
     fi
-    for cmd in curl od cmp wc python3; do
+    for cmd in curl od cmp wc python3 unzip; do
         command -v "$cmd" >/dev/null 2>&1 || error "Required command is still missing after installation: ${cmd}"
     done
 }
@@ -269,22 +270,7 @@ ask_transport() {
 }
 
 select_transport_release() {
-    CHANNEL="release"; VERSION="latest"
-    if [ "${QM_PROFILE:-}" = gaming ]; then
-        info "Quantum Gaming: stable v4.2.8+ or beta v4.3.1+, on BOTH endpoints."
-        ask_version "$1" "v4.3.1" "v4.2.8"
-        return
-    fi
-    case "$TRANSPORT" in
-        dc6)
-            info "DC6: stable v4.2.8+ or beta v4.2.9+, on BOTH endpoints."
-            ask_version "$1" "v4.2.9" "v4.2.8"
-            ;;
-        quantum-gaming)
-            info "Quantum Gaming: stable v4.2.8+ or beta v4.3.1+, on BOTH endpoints."
-            ask_version "$1" "v4.3.1" "v4.2.8"
-            ;;
-    esac
+    CHANNEL="release"; VERSION="$FIXED_VERSION"
     info "Version : ${VERSION} (${CHANNEL})"
 }
 
@@ -729,45 +715,59 @@ tune_network() {
 }
 
 download_latest_launcher() {
-    local tmp magic size
+    local work zip f magic size best=0 bin=""
     mkdir -p "$(dirname "$LAUNCHER")"
-    tmp=$(mktemp "${LAUNCHER}.XXXXXX")
+    work=$(mktemp -d /var/tmp/dc-bin.XXXXXX) || return 1
+    zip="${work}/pkg.zip"
 
+    info "Downloading binary package from your release..."
     if ! curl --fail --silent --show-error --location \
         --retry 3 --retry-delay 2 --retry-connrefused \
-        --connect-timeout 15 --max-time 180 \
-        -o "$tmp" "$LAUNCHER_LATEST_URL"; then
-        rm -f "$tmp"
+        --connect-timeout 15 --max-time 300 \
+        -o "$zip" "$BINARY_ZIP_URL"; then
+        rm -rf "$work"
         return 1
     fi
 
-    size=$(wc -c < "$tmp" 2>/dev/null || echo 0)
-    magic=$(LC_ALL=C od -An -tx1 -N4 "$tmp" 2>/dev/null | tr -d ' \n')
-    if [ "$magic" != "7f454c46" ] || [ "$size" -lt 1048576 ]; then
-        rm -f "$tmp"
-        warn "Latest launcher asset is not a valid Linux ELF binary (size=${size}, magic=${magic:-unknown})."
+    if ! unzip -q -o "$zip" -d "${work}/x"; then
+        warn "The downloaded file is not a valid zip archive."
+        rm -rf "$work"
         return 1
     fi
 
-    chmod 0755 "$tmp"
-    if [ -f "$LAUNCHER" ] && cmp -s "$tmp" "$LAUNCHER"; then
-        rm -f "$tmp"
-        info "DaggerLauncher is already the latest published release."
-        return 0
+    # Pick the largest Linux ELF file inside the archive.
+    while IFS= read -r f; do
+        magic=$(LC_ALL=C od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n')
+        [ "$magic" = "7f454c46" ] || continue
+        size=$(wc -c < "$f" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$best" ]; then best="$size"; bin="$f"; fi
+    done < <(find "${work}/x" -type f)
+
+    if [ -z "$bin" ] || [ "$best" -lt 1048576 ]; then
+        warn "No valid Linux ELF binary found inside the zip."
+        rm -rf "$work"
+        return 1
     fi
-    mv -f "$tmp" "$LAUNCHER"
+
+    chmod 0755 "$bin"
+    if [ -f "$LAUNCHER" ] && cmp -s "$bin" "$LAUNCHER"; then
+        info "DaggerLauncher is already installed from your release."
+    else
+        mv -f "$bin" "$LAUNCHER"
+    fi
+    rm -rf "$work"
     return 0
 }
 
 ensure_launcher() {
     local role="$1"
-    info "Checking the latest DaggerLauncher release..."
+    info "Installing DaggerLauncher from your own release..."
     if download_latest_launcher; then
         ok "DaggerLauncher ready : ${LAUNCHER}"
         return 0
     fi
     if [ -x "$LAUNCHER" ]; then
-        warn "Could not fetch the latest launcher; keeping the existing executable."
+        warn "Could not fetch the launcher; keeping the existing executable."
         return 0
     fi
     error "Failed to download DaggerLauncher -- check network/DNS, or place a Linux launcher at ${LAUNCHER}, chmod +x it, and re-run."
@@ -777,7 +777,7 @@ update_launcher() {
     hr "Update Launcher"
     echo ""
 
-    step "Downloading latest DaggerLauncher from GitHub..."
+    step "Downloading DaggerLauncher from your release..."
     if ! download_latest_launcher; then
         error "Download failed -- check network/DNS. ${LAUNCHER} was left untouched."
     fi
@@ -840,150 +840,17 @@ except (ValueError, TypeError) as exc:
 '
 }
 
+# Fixed version from your own release: no online version list, no prompts.
 ask_version() {
-    local role="$1" required_min="${2:-}" release_min="${3:-${2:-}}" selected_min
-
-    echo ""
-    info "Fetching available versions..."
-
-    local json rows channel version
-    # Preserve stderr: an HTTP/TLS/launcher error is not an empty release list.
-    if ! json=$("$LAUNCHER" --list-versions --role "$role"); then
-        warn "Launcher could not retrieve versions for role=${role}; see the error above."
-        ask_channel_manual "$required_min" "$release_min"
-        return
-    fi
-    if ! rows=$(printf '%s' "$json" | parse_version_list); then
-        warn "Version-list parsing failed; falling back to manual entry."
-        ask_channel_manual "$required_min" "$release_min"
-        return
-    fi
-
-    local labels=() chans=() vers=() ch ver
-    local -a rel_list=() beta_list=()
-
-    while IFS=$'\t' read -r channel version; do
-        version="${version%$'\r'}"
-        [ -n "$version" ] || continue
-        selected_min="$required_min"
-        [ "$channel" != release ] || selected_min="$release_min"
-        if [ -n "$selected_min" ] && ! version_at_least "$version" "$selected_min"; then
-            continue
-        fi
-        case "$channel" in
-            release) rel_list+=("$version") ;;
-            beta)    beta_list+=("$version") ;;
-        esac
-    done <<< "$rows"
-
-    if [ "$(( ${#rel_list[@]} + ${#beta_list[@]} ))" -eq 0 ]; then
-        warn "No published versions meet this selection. Check the releases directory or enter a published version manually."
-        ask_channel_manual "$required_min" "$release_min"
-        return
-    fi
-
-    # Newest first inside each channel.
-    if [ "${#rel_list[@]}" -gt 0 ]; then
-        mapfile -t rel_list < <(printf '%s\n' "${rel_list[@]}" | sort -V -r -u)
-    fi
-    if [ "${#beta_list[@]}" -gt 0 ]; then
-        mapfile -t beta_list < <(printf '%s\n' "${beta_list[@]}" | sort -V -r -u)
-    fi
-
-    if [ -n "$required_min" ]; then
-        info "Minimum: stable ${release_min}, beta ${required_min}. Pick a numbered version."
-    fi
-
-    echo ""
-    echo -e "  ${BOLD}Core version${NC}"
-    local i=1
-    local -a sections=("release:Stable" "beta:Beta")
-    local sec name list_ref
-    for sec in "${sections[@]}"; do
-        ch="${sec%%:*}"; name="${sec#*:}"
-        if [ "$ch" = release ]; then list_ref=("${rel_list[@]}"); else list_ref=("${beta_list[@]}"); fi
-        if [ -z "$required_min" ]; then
-            :
-        elif [ "${#list_ref[@]}" -eq 0 ]; then
-            continue
-        fi
-        echo ""
-        echo -e "  ${BOLD}${name}${NC}"
-        if [ -z "$required_min" ]; then
-            echo "    ${i})  latest ${name,,}   (follows new ${name,,} builds on each start)"
-            chans+=("$ch"); vers+=("latest"); labels+=("latest")
-            i=$((i + 1))
-        fi
-        for ver in "${list_ref[@]}"; do
-            echo "    ${i})  ${ver}"
-            chans+=("$ch"); vers+=("$ver"); labels+=("$ver")
-            i=$((i + 1))
-        done
-    done
-
-    echo ""
-
-    while true; do
-        ask VER_CHOICE "Pick a version" "1"
-
-        if [[ "$VER_CHOICE" =~ ^[0-9]{1,9}$ ]] \
-            && (( 10#$VER_CHOICE >= 1 && 10#$VER_CHOICE <= ${#labels[@]} )); then
-
-            local idx=$((10#$VER_CHOICE - 1))
-
-            CHANNEL="${chans[$idx]}"
-            VERSION="${vers[$idx]}"
-
-            break
-        fi
-
-        warn "Please enter a number between 1 and ${#labels[@]}."
-    done
-
-    info "Selected : ${VERSION}  ($([ "$CHANNEL" = release ] && echo stable || echo beta))"
+    CHANNEL="release"
+    VERSION="$FIXED_VERSION"
+    info "Version : ${VERSION} (fixed, from your own release)"
 }
 
 ask_channel_manual() {
-    local required_min="${1:-}" release_min="${2:-${1:-}}"
-    echo ""
-    echo -e "  ${BOLD}Release Channel:${NC}"
-    echo "    1)  release"
-    echo "    2)  beta"
-    echo ""
-    while true; do
-        ask CH_CHOICE "Channel" "1"
-        case "$CH_CHOICE" in
-            1|release) CHANNEL="release"; break ;;
-            2|beta)    CHANNEL="beta";    break ;;
-            *) warn "Please enter 1 (release) or 2 (beta)." ;;
-        esac
-    done
-    info "Channel : ${CHANNEL}"
-    [ "$CHANNEL" != release ] || required_min="$release_min"
-
-    echo ""
-    if [ -n "$required_min" ]; then
-        info "Enter a published version >= ${required_min}; 'latest' cannot be verified here."
-    else
-        info "Enter vN.N.N, or leave empty to track latest on ${CHANNEL}."
-    fi
-    while true; do
-        ask VER_INPUT "Version${required_min:+ (minimum ${required_min})}" ""
-        if [ -z "$VER_INPUT" ] && [ -z "$required_min" ]; then
-            VERSION="latest"
-            break
-        fi
-        if echo "$VER_INPUT" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            if [ -n "$required_min" ] && ! version_at_least "$VER_INPUT" "$required_min"; then
-                warn "This transport requires ${required_min} or newer."
-                continue
-            fi
-            VERSION="$VER_INPUT"
-            break
-        fi
-        warn "Use vN.N.N${required_min:+ at or above ${required_min}}."
-    done
-    info "Version : ${VERSION}"
+    CHANNEL="release"
+    VERSION="$FIXED_VERSION"
+    info "Version : ${VERSION} (fixed, from your own release)"
 }
 
 switch_channel() {
