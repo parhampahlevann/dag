@@ -13,7 +13,8 @@ if [ ! -t 1 ] || [ "${TERM:-dumb}" = dumb ] || [ -n "${NO_COLOR+x}" ]; then
 fi
 
 LAUNCHER="/usr/local/bin/DaggerLauncher"
-BINARY_ZIP_URL="https://github.com/parhampahlevann/dag/releases/download/v4.2.8/v4.2.8.zip"
+BINARY_ZIP_URL="https://github.com/parhampahlevann/dag/releases/download/v4.2.8/v4.2.8-stable.zip"
+LAUNCHER_ZIP_URL="https://github.com/parhampahlevann/dag/releases/download/v4.2.8/DaggerLauncher.zip"
 FIXED_VERSION="v4.2.8"
 CONFIG_DIR="/etc/DaggerConnect"
 CONFIG=""
@@ -151,7 +152,6 @@ ask_service_name() {
         break
     done
 
-    # The launcher reads JSON. The core still accepts existing YAML profiles.
     CONFIG_FMT="json"
     SERVICE_NAME="${LABEL}"
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -168,7 +168,6 @@ detect_server_public_ip() {
         return 0
     fi
 
-    # Kernel route lookup only; this does not send a packet or query a website.
     local ip
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}')
     if validate_public_ip "$ip"; then
@@ -306,7 +305,6 @@ except OSError:
 }
 
 validate_transport_ip() {
-    # Literal addresses only. Never resolve user input or call an IP-check site.
     python3 -c '
 import ipaddress, sys
 try:
@@ -347,7 +345,6 @@ ask_dc6_address() {
         else
             ask_required value "Server IPv6 for tunnel traffic (address only, no port)"
         fi
-        # Accept pasted [IPv6] too, but not [IPv6]:port or scope IDs.
         value="${value#[}"; value="${value%]}"
         if ! validate_transport_ip "$value" 6 "$side"; then
             warn "Enter an IPv6 unicast address; no IPv4, zone, link-local address or port."
@@ -708,19 +705,60 @@ check_ptrace_scope() {
 }
 
 tune_network() {
-    # Runtime owns bounded tuning; do not overwrite host policy during install.
-    # In particular, never run sysctl --system (which applies unrelated files).
     info "This core tunes kernel buffer/queue ceilings at tunnel startup (unless tuner is off)."
     info "Existing sysctl files, congestion control and interface queues are preserved."
 }
 
-download_latest_launcher() {
+download_launcher() {
     local work zip f magic size best=0 bin=""
     mkdir -p "$(dirname "$LAUNCHER")"
-    work=$(mktemp -d /var/tmp/dc-bin.XXXXXX) || return 1
-    zip="${work}/pkg.zip"
+    work=$(mktemp -d /var/tmp/dc-launcher.XXXXXX) || return 1
+    zip="${work}/launcher.zip"
 
-    info "Downloading binary package from your release..."
+    info "Downloading DaggerLauncher..."
+    if ! curl --fail --silent --show-error --location \
+        --retry 3 --retry-delay 2 --retry-connrefused \
+        --connect-timeout 15 --max-time 300 \
+        -o "$zip" "$LAUNCHER_ZIP_URL"; then
+        rm -rf "$work"
+        return 1
+    fi
+
+    if ! unzip -q -o "$zip" -d "${work}/x"; then
+        warn "The downloaded file is not a valid zip archive."
+        rm -rf "$work"
+        return 1
+    fi
+
+    while IFS= read -r f; do
+        magic=$(LC_ALL=C od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n')
+        [ "$magic" = "7f454c46" ] || continue
+        size=$(wc -c < "$f" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$best" ]; then best="$size"; bin="$f"; fi
+    done < <(find "${work}/x" -type f)
+
+    if [ -z "$bin" ] || [ "$best" -lt 1048576 ]; then
+        warn "No valid Linux ELF binary found inside the launcher zip."
+        rm -rf "$work"
+        return 1
+    fi
+
+    chmod 0755 "$bin"
+    if [ -f "$LAUNCHER" ] && cmp -s "$bin" "$LAUNCHER"; then
+        info "DaggerLauncher is already installed."
+    else
+        mv -f "$bin" "$LAUNCHER"
+    fi
+    rm -rf "$work"
+    return 0
+}
+
+download_core_binary() {
+    local work zip f magic size best=0 bin=""
+    work=$(mktemp -d /var/tmp/dc-core.XXXXXX) || return 1
+    zip="${work}/core.zip"
+
+    info "Downloading core binary package..."
     if ! curl --fail --silent --show-error --location \
         --retry 3 --retry-delay 2 --retry-connrefused \
         --connect-timeout 15 --max-time 300 \
@@ -735,7 +773,6 @@ download_latest_launcher() {
         return 1
     fi
 
-    # Pick the largest Linux ELF file inside the archive.
     while IFS= read -r f; do
         magic=$(LC_ALL=C od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n')
         [ "$magic" = "7f454c46" ] || continue
@@ -744,26 +781,27 @@ download_latest_launcher() {
     done < <(find "${work}/x" -type f)
 
     if [ -z "$bin" ] || [ "$best" -lt 1048576 ]; then
-        warn "No valid Linux ELF binary found inside the zip."
+        warn "No valid Linux ELF binary found inside the core zip."
         rm -rf "$work"
         return 1
     fi
 
     chmod 0755 "$bin"
-    if [ -f "$LAUNCHER" ] && cmp -s "$bin" "$LAUNCHER"; then
-        info "DaggerLauncher is already installed from your release."
-    else
-        mv -f "$bin" "$LAUNCHER"
-    fi
+    mv -f "$bin" "${LAUNCHER}.core"
     rm -rf "$work"
     return 0
 }
 
 ensure_launcher() {
     local role="$1"
-    info "Installing DaggerLauncher from your own release..."
-    if download_latest_launcher; then
+    info "Installing DaggerLauncher from release..."
+    if download_launcher; then
         ok "DaggerLauncher ready : ${LAUNCHER}"
+        if download_core_binary; then
+            ok "Core binary ready : ${LAUNCHER}.core"
+        else
+            warn "Could not fetch the core binary; the launcher will download it on first run."
+        fi
         return 0
     fi
     if [ -x "$LAUNCHER" ]; then
@@ -777,9 +815,12 @@ update_launcher() {
     hr "Update Launcher"
     echo ""
 
-    step "Downloading DaggerLauncher from your release..."
-    if ! download_latest_launcher; then
+    step "Downloading DaggerLauncher and Core from your release..."
+    if ! download_launcher; then
         error "Download failed -- check network/DNS. ${LAUNCHER} was left untouched."
+    fi
+    if ! download_core_binary; then
+        warn "Core binary download failed, but launcher is updated."
     fi
     ok "DaggerLauncher updated : ${LAUNCHER}"
 
@@ -840,7 +881,6 @@ except (ValueError, TypeError) as exc:
 '
 }
 
-# Fixed version from your own release: no online version list, no prompts.
 ask_version() {
     CHANNEL="release"
     VERSION="$FIXED_VERSION"
@@ -914,10 +954,6 @@ switch_channel() {
     set_unit_env DC_CHANNEL "$new_channel"
     set_unit_env DC_VERSION "$new_version"
 
-    # Migrate services created by older installers.  A failing launcher/core
-    # used to be restarted every five seconds, which amplified an authority
-    # outage into a request storm.  Exit 78 is a permanent host/config
-    # limitation and must stay stopped until the operator fixes it.
     if grep -q '^RestartSec=' "$svc_file" 2>/dev/null; then
         sed -i 's/^RestartSec=.*/RestartSec=60/' "$svc_file"
     else
@@ -1186,7 +1222,6 @@ ask_tun_encapsulation() {
     return 0
 }
 
-# Optional "profile" line for the quantum block; empty unless Quantum Gaming.
 quantum_profile_json() {
     if [ "${QM_PROFILE:-}" = gaming ]; then
         printf ',\n    "profile": "gaming"'
@@ -1545,8 +1580,6 @@ ask_dc() {
 }
 
 write_native_dc_config() {
-    # JSON is also valid YAML, so these writers support existing YAML callers.
-    # Serialize user strings, especially PSKs, instead of interpolating raw JSON.
     local role="$1" transport="$2" endpoint="$3" license_addr="$4" ipv6_addr="$5" psk="$6"
     shift 6
     local common maps socks tmp
@@ -2836,8 +2869,6 @@ write_client_config_tun() {
 }
 
 install_service() {
-    # Stop before replacing the unit if generated fields are not valid JSON.
-    # Do not print the document: it contains the user's PSK.
     if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$CONFIG" >/dev/null 2>&1; then
         error "Invalid JSON configuration; service unchanged. Check quoted input values."
     fi
@@ -3529,16 +3560,6 @@ edit_config() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# Tester (menu 11)
-#
-# Server side: this server waits for the test.  Client side: this server runs it
-# against the Server.  The test itself lives in the licensed core and runs through
-# the launcher; the license is checked there, never here.  This installer only
-# starts the launcher and shows what the core prints, with its exit status as the
-# final answer.  Both sides use the PSK of the tunnel you plan to build and the
-# fixed pairing profile ID below, so there is nothing else to type or copy.
-# ---------------------------------------------------------------------------
 LINKTEST_PROFILE_ID="DC-TEST"
 LINKTEST_TMP_CFG=""
 LT_PSK=""
@@ -3552,7 +3573,6 @@ linktest_cleanup() {
 }
 
 linktest_installed_profiles() {
-    # file<TAB>mode<TAB>profile_id for installed configs. Never prints a PSK.
     python3 - "$CONFIG_DIR" <<'PY'
 import glob, json, os, sys
 for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
@@ -3613,7 +3633,6 @@ linktest_pick_pairing() {
 }
 
 linktest_write_config() {
-    # role peer -> sets LINKTEST_TMP_CFG (0600, removed on exit)
     local role="$1" peer="${2:-}" old_umask
     old_umask=$(umask)
     umask 077
@@ -3623,8 +3642,6 @@ linktest_write_config() {
 import json, os, sys
 role, path = sys.argv[1], sys.argv[2]
 psk, profile, peer = os.environ["LT_PSK"], os.environ["LT_PROFILE"], os.environ.get("LT_PEER", "")
-# The core derives the real test port from the PSK; this port is a placeholder
-# that only has to make the config valid for the launcher.
 if role == "server":
     cfg = {"mode": "server", "psk": psk, "profile_id": profile,
            "listeners": [{"addr": "0.0.0.0:20000", "transport": "tcp", "maps": []}]}
@@ -3641,8 +3658,6 @@ PY
     chmod 600 "$LINKTEST_TMP_CFG"
 }
 
-# Runs the core through the launcher; retries once with another core version when
-# the fetched core does not include Link Test.
 linktest_run_core() {
     local role="$1"; shift
     local log rc attempt
@@ -3670,7 +3685,6 @@ linktest_run_core() {
 }
 
 linktest_run() {
-    # role peer quick
     local role="$1" peer="${2:-}" quick="${3:-}" rc args=()
     CHANNEL="${DC_CHANNEL:-release}"; VERSION="${DC_VERSION:-latest}"
     ensure_launcher "$role"
